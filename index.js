@@ -15,10 +15,12 @@ export const MOCK = rawMock === "1";
 const PORT = process.env.PORT || 8080;
 
 const TRADIER_REST   = process.env.TRADIER_BASE || "https://api.tradier.com";
-const TRADIER_TOKEN  = process.env.TRADIER_TOKEN || "REPLACE_ME";
-const ALPACA_KEY     = process.env.ALPACA_KEY     || "";
-const ALPACA_SECRET  = process.env.ALPACA_SECRET  || "";
-
+// const TRADIER_TOKEN  = process.env.TRADIER_TOKEN || "REPLACE_ME";
+// const ALPACA_KEY     = process.env.ALPACA_KEY     || "";
+// const ALPACA_SECRET  = process.env.ALPACA_SECRET  || "";
+const TRADIER_TOKEN  = "DZi4KKhQVv05kjgqXtvJRyiFbEhn"; //process.env.TRADIER_TOKEN; // set me
+const ALPACA_KEY     = "AKNND2CVUEIRFCDNVMXL2NYVWD"; // process.env.ALPACA_KEY;    // set me
+const ALPACA_SECRET  = "5xBdG2Go1PtWE36wnCrB4vES6mGF6tkusqDL7uSnnCxy"; 
 // chain auto-expand
 const MAX_STRIKES_AROUND_ATM = 40;   // total (±20)
 const MAX_EXPIRY_DAYS        = 30;
