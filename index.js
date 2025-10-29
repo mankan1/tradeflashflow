@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 import "./instrument-http.js";
 import { httpMetrics } from "./instrument-http.js";
 import http from "http";
@@ -14,24 +15,24 @@ export const MOCK = rawMock === "1";
 const PORT = process.env.PORT || 8080;
 
 const TRADIER_REST   = process.env.TRADIER_BASE || "https://api.tradier.com";
-const TRADIER_TOKEN  = "DZi4KKhQVv05kjgqXtvJRyiFbEhn"; //process.env.TRADIER_TOKEN; // set me
-const ALPACA_KEY     = "AKNND2CVUEIRFCDNVMXL2NYVWD"; // process.env.ALPACA_KEY;    // set me
-const ALPACA_SECRET  = "5xBdG2Go1PtWE36wnCrB4vES6mGF6tkusqDL7uSnnCxy"; //process.env.ALPACA_SECRET; // set me
+const TRADIER_TOKEN  = process.env.TRADIER_TOKEN || "REPLACE_ME";
+const ALPACA_KEY     = process.env.ALPACA_KEY     || "";
+const ALPACA_SECRET  = process.env.ALPACA_SECRET  || "";
 
 // chain auto-expand
 const MAX_STRIKES_AROUND_ATM = 40;   // total (±20)
 const MAX_EXPIRY_DAYS        = 30;
 
-// sweep / block thresholds (tune these)
-const SWEEP_WINDOW_MS        = 600;  // burst window per contract
-const SWEEP_MIN_QTY          = 300;  // total prints qty in window
+// sweep / block thresholds
+const SWEEP_WINDOW_MS        = 600;
+const SWEEP_MIN_QTY          = 300;
 const SWEEP_MIN_NOTIONAL     = 75000;
 
-const BLOCK_MIN_QTY          = 250;  // single print qty
+const BLOCK_MIN_QTY          = 250;
 const BLOCK_MIN_NOTIONAL     = 100000;
 
 // fallback timesales polling
-const FALLBACK_IDLE_MS       = 3500; // if no WS prints for a contract this long, poll REST
+const FALLBACK_IDLE_MS       = 3500;
 const FALLBACK_POLL_EVERY_MS = 1500;
 
 /* ================= APP / WS ================= */
@@ -54,40 +55,118 @@ const buffers = {
   chains:    [],
 };
 const seenIds = Object.fromEntries(Object.keys(buffers).map(t => [t, new Set()]));
-
+/* ===== EOD OI storage for confirmation ===== */
+const eodOiByDateOcc = new Map(); // key: `${date}|${occ}` -> number
+const lastEodDateForOcc = new Map(); // occ -> last date string we saw for that occ
 /* ================= STATE ================= */
-const eqQuote = new Map(); // symbol -> { bid, ask, ts }
-const optState = new Map(); // UL|YYYY-MM-DD|strike|right -> { oi_before, vol_today_before, last_reset }
+// equities NBBO (bid/ask), options NBBO (by OCC)
+const eqQuote  = new Map();
+const optNBBO  = new Map();
+// OI / VOL baselines per OCC key (UL|YYYY-MM-DD|strike|right)
+const optState = new Map();
 const dayKey = () => new Date().toISOString().slice(0,10);
 
+// watches
 const alpacaSubs = new Set();               // equities
-const tradierOptWatch = { set: new Set() }; // options watch set (JSON strings)
+const tradierOptWatch = { set: new Set() }; // option JSON strings
 
-// for fallback poller and sweeps
+// fallback + sweeps
 const optLastPrintTs = new Map(); // occ -> last ts seen
-const sweepBuckets   = new Map(); // occ -> { side, startTs, totalQty, notional, prints: [...] }
+const sweepBuckets   = new Map(); // occ -> burst bucket
 
+// very light “lean memory” of recent opens per OCC
+const recentOpenLean = new Map(); // occ -> "BTO" | "STO" | "UNK"
+function ymdFromTs(ts) {
+  const d = new Date(ts);
+  return d.toISOString().slice(0,10);
+}
+
+/**
+ * Update buffers.* items for a given OCC on a given date (the trade-date)
+ * using OI delta between EOD(date-1) and EOD(date).
+ * We set:
+ *   m.oi_after, m.oi_delta, m.oc_confirm ("OPEN_CONFIRMED" | "CLOSE_CONFIRMED" | "INCONCLUSIVE")
+ *   m.oc_confirm_reason
+ */
+function confirmOccForDate(occ, dateStr) {
+  const d0 = new Date(dateStr);
+  const prev = new Date(d0.getTime() - 24*3600*1000);
+  const prevDate = prev.toISOString().slice(0,10);
+
+  const oiPrev = eodOiByDateOcc.get(`${prevDate}|${occ}`);
+  const oiCurr = eodOiByDateOcc.get(`${dateStr}|${occ}`);
+
+  if (!Number.isFinite(oiPrev) || !Number.isFinite(oiCurr)) return 0;
+  const delta = oiCurr - oiPrev;
+
+  const confirmOne = (m) => {
+    // only annotate prints that belong to that OCC and calendar date
+    if (m.occ !== occ) return false;
+    const day = ymdFromTs(m.ts || Date.now());
+    if (day !== dateStr) return false;
+
+    // Default
+    let oc_confirm = "INCONCLUSIVE";
+    let reason = `ΔOI=${delta} from ${prevDate}→${dateStr}`;
+
+    // Rules:
+    //   ΔOI > 0  → net opens.  If we tagged BTO/STO, mark OPEN_CONFIRMED
+    //   ΔOI < 0  → net closes. If we tagged BTC/STC, mark CLOSE_CONFIRMED
+    // (Mixed intraday flows can still be inconclusive at single-print level.)
+    if (delta > 0 && (m.oc_intent === "BTO" || m.oc_intent === "STO")) {
+      oc_confirm = "OPEN_CONFIRMED";
+      reason += " (OI increased → opens)";
+    } else if (delta < 0 && (m.oc_intent === "BTC" || m.oc_intent === "STC")) {
+      oc_confirm = "CLOSE_CONFIRMED";
+      reason += " (OI decreased → closes)";
+    }
+
+    // annotate
+    m.oi_after = oiCurr;
+    m.oi_delta = delta;
+    m.oc_confirm = oc_confirm;
+    m.oc_confirm_reason = reason;
+    m.oc_confirm_ts = Date.now();
+    return true;
+  };
+
+  let touched = 0;
+  for (const arrName of ["options_ts", "sweeps", "blocks"]) {
+    const arr = buffers[arrName];
+    for (const m of arr) if (confirmOne(m)) touched++;
+  }
+  return touched;
+}
+
+/** Record EOD OI rows, return #rows recorded */
+function recordEodRows(dateStr, rows) {
+  let n = 0;
+  for (const r of rows) {
+    // allow either explicit occ or UL/exp/right/strike
+    let occ = r.occ;
+    if (!occ && r.underlying && r.expiration && r.right && Number.isFinite(Number(r.strike))) {
+      occ = toOcc(String(r.underlying).toUpperCase(), String(r.expiration), String(r.right).toUpperCase(), Number(r.strike));
+    }
+    const oi = Number(r.oi);
+    if (!occ || !Number.isFinite(oi)) continue;
+
+    eodOiByDateOcc.set(`${dateStr}|${occ}`, oi);
+    lastEodDateForOcc.set(occ, dateStr);
+    n++;
+  }
+  return n;
+}
 /* ================= HELPERS ================= */
 function getOptState(key) {
   const today = dayKey();
   const s = optState.get(key) ?? { oi_before: 0, vol_today_before: 0, last_reset: today };
   if (s.last_reset !== today) { s.vol_today_before = 0; s.last_reset = today; }
+  optState.set(key, s);
   return s;
 }
 const setOptOI  = (k, oi) => { const s = getOptState(k); s.oi_before = Number(oi)||0; optState.set(k, s); };
 const setOptVol = (k, v)  => { const s = getOptState(k); s.vol_today_before = Math.max(0, Number(v)||0); optState.set(k, s); };
 const bumpOptVol = (k, qty) => { const s = getOptState(k); s.vol_today_before += Number(qty)||0; optState.set(k, s); };
-
-function classifyOptionAction(side, qty, oi_before, vol_today_before) {
-  if (qty > (oi_before + vol_today_before)) return side === "BUY" ? "BTO" : "STO";
-  if (qty <= oi_before)                   return side === "BUY" ? "BTC" : "STC";
-  return "UNK";
-}
-function classifyEquitySide(price, bid, ask) {
-  if (Number.isFinite(ask) && price >= ask) return "BUY";
-  if (Number.isFinite(bid) && price <= bid) return "SELL";
-  return "MID";
-}
 
 function stableId(msg) {
   const key = JSON.stringify({
@@ -126,35 +205,107 @@ function pushAndFanout(msg) {
   broadcast(m);
 }
 
-function normOptionsPrint(provider, { underlying, option, price, size, side, venue, oi, volToday }) {
+function toOcc(ul, expISO, right, strike) {
+  const yymmdd = expISO.replaceAll("-", "").slice(2);
+  const cp = String(right).toUpperCase().startsWith("C") ? "C" : "P";
+  const k = String(Math.round(Number(strike) * 1000)).padStart(8, "0");
+  return `${ul.toUpperCase()}${yymmdd}${cp}${k}`;
+}
+function parseOcc(occ) {
+  const m = /^([A-Z]+)(\d{6})([CP])(\d{8})$/.exec(occ);
+  if (!m) return null;
+  const [ , ul, yymmdd, cp, k ] = m;
+  const exp = `20${yymmdd.slice(0,2)}-${yymmdd.slice(2,4)}-${yymmdd.slice(4,6)}`;
+  return { ul, exp, right: cp === "C" ? "CALL" : "PUT", strike: Number(k)/1000 };
+}
+
+/* ---- aggressor from NBBO (for options) ---- */
+function classifyAggressor(price, nbbo) {
+  if (!nbbo) return { side: "UNK", at: "MID" };
+  const bid = Number(nbbo.bid ?? 0);
+  const ask = Number(nbbo.ask ?? 0);
+  if (!Number.isFinite(ask) || ask <= 0) return { side: "UNK", at: "MID" };
+  const mid = (bid + ask) / 2;
+  const eps = Math.max(0.01, (ask - bid) / 20);
+  if (price >= Math.max(ask - eps, bid)) return { side: "BUY",  at: "ASK" };
+  if (price <= Math.min(bid + eps, ask)) return { side: "SELL", at: "BID" };
+  return { side: price >= mid ? "BUY" : "SELL", at: "MID" };
+}
+
+/* ---- opening/closing inference ---- */
+function inferIntent(occ, side, qty, price) {
+  const s = getOptState(occ);
+  const nbbo = optNBBO.get(occ);
+  const { side: aggrSide, at } = classifyAggressor(price, nbbo);
+
+  let tag = "UNK"; // "BTO"|"STO"|"BTC"|"STC"|"UNK"
+  let conf = 0.35;
+  const reasons = [];
+
+  // OPEN if qty > (yday OI + today VOL so far)
+  if (qty > (s.oi_before + s.vol_today_before)) {
+    tag = side === "BUY" ? "BTO" : "STO";
+    conf = 0.8;
+    reasons.push("qty > (yday OI + today vol)");
+    recentOpenLean.set(occ, tag);
+  } else {
+    const prior = recentOpenLean.get(occ) || "UNK";
+    const qtyWithinOI = qty <= s.oi_before;
+    if (qtyWithinOI) reasons.push("qty <= yday OI");
+
+    // “Human lean”:
+    if (prior === "BTO" && side === "SELL" && (at === "BID" || aggrSide === "SELL")) {
+      tag = "STC"; conf = qtyWithinOI ? 0.7 : 0.55;
+      reasons.push("prior=open(BTO)", "sell@bid");
+    } else if (prior === "STO" && side === "BUY" && (at === "ASK" || aggrSide === "BUY")) {
+      tag = "BTC"; conf = qtyWithinOI ? 0.7 : 0.55;
+      reasons.push("prior=open(STO)", "buy@ask");
+    } else {
+      if (side === "SELL" && at === "BID" && qtyWithinOI) { tag = "STC"; conf = 0.55; reasons.push("sell@bid"); }
+      if (side === "BUY"  && at === "ASK" && qtyWithinOI) { tag = "BTC"; conf = 0.55; reasons.push("buy@ask"); }
+    }
+  }
+
+  return { tag, conf, at, reasons, oi_yday: s.oi_before, vol_before: s.vol_today_before };
+}
+
+/* ---- normalized prints ---- */
+function normOptionsPrint(provider, p) {
   const now = Date.now();
-  const key = `${underlying}|${option.expiration}|${option.strike}|${option.right}`;
-  if (Number.isFinite(oi)) setOptOI(key, Number(oi));
-  if (Number.isFinite(volToday)) setOptVol(key, Number(volToday));
-  const s = getOptState(key);
-  const action = classifyOptionAction(side, size, s.oi_before, s.vol_today_before);
-  bumpOptVol(key, size);
+  const key = `${p.underlying}|${p.option.expiration}|${p.option.strike}|${p.option.right}`;
+  if (Number.isFinite(p.oi)) setOptOI(key, Number(p.oi));
+  if (Number.isFinite(p.volToday)) setOptVol(key, Number(p.volToday));
+  const occ = p.occ ?? toOcc(p.underlying, p.option.expiration, p.option.right, p.option.strike);
+
+  const intent = inferIntent(occ, p.side, p.size, p.price);
+  bumpOptVol(key, p.size);
+
   return {
     id: `${now}-${Math.random().toString(36).slice(2,8)}`,
     ts: now,
     type: "options_ts",
     provider,
-    symbol: underlying,
-    occ: toOcc(underlying, option.expiration, option.right, option.strike),
-    option,
-    side,        // BUY | SELL
-    qty: size,
-    price,
-    action,      // BTO | STO | BTC | STC | UNK
-    oi_before: s.oi_before,
-    vol_before: s.vol_today_before,
-    venue: venue ?? null
+    symbol: p.underlying,
+    occ,
+    option: p.option,
+    side: p.side,        // BUY | SELL
+    qty: p.size,
+    price: p.price,
+    oc_intent: intent.tag,       // BTO/STO/BTC/STC/UNK
+    intent_conf: intent.conf,    // 0..1
+    fill_at: intent.at,          // BID|ASK|MID
+    intent_reasons: intent.reasons,
+    oi_before: intent.oi_yday,
+    vol_before: intent.vol_before,
+    venue: p.venue ?? null
   };
 }
 function normEquityPrint(provider, { symbol, price, size }) {
   const now = Date.now();
   const q = eqQuote.get(symbol);
-  const side = q ? classifyEquitySide(price, q.bid, q.ask) : "MID";
+  const side = (!q?.ask || !q?.bid)
+    ? "MID"
+    : (price >= q.ask ? "BUY" : (price <= q.bid ? "SELL" : "MID"));
   return {
     id: `${now}-${Math.random().toString(36).slice(2,8)}`,
     ts: now,
@@ -165,12 +316,6 @@ function normEquityPrint(provider, { symbol, price, size }) {
     action: "UNK",
     venue: null
   };
-}
-function toOcc(ul, expISO, right, strike) {
-  const yymmdd = expISO.replaceAll("-", "").slice(2);
-  const cp = String(right).toUpperCase().startsWith("C") ? "C" : "P";
-  const k = String(Math.round(Number(strike) * 1000)).padStart(8, "0");
-  return `${ul.toUpperCase()}${yymmdd}${cp}${k}`;
 }
 
 /* ================= ALPACA (equities) ================= */
@@ -184,16 +329,17 @@ async function ensureAlpacaWS() {
   alpacaWS = new WebSocket(url);
 
   alpacaWS.onopen = () => {
-    alpacaWS.send(JSON.stringify({ action: "auth", key: ALPACA_KEY, secret: ALPACA_SECRET }));
-    if (alpacaSubs.size) {
-      alpacaWS.send(JSON.stringify({ action: "subscribe",
-        trades: Array.from(alpacaSubs),
-        quotes: Array.from(alpacaSubs) }));
-    }
+    try {
+      alpacaWS.send(JSON.stringify({ action: "auth", key: ALPACA_KEY, secret: ALPACA_SECRET }));
+      if (alpacaSubs.size) {
+        const list = Array.from(alpacaSubs);
+        alpacaWS.send(JSON.stringify({ action: "subscribe", trades: list, quotes: list }));
+      }
+    } catch {}
   };
   alpacaWS.onmessage = (e) => {
     try {
-      const arr = JSON.parse(e.data);
+      const arr = JSON.parse(String(e.data));
       if (!Array.isArray(arr)) return;
       for (const m of arr) {
         if (m.T === "q") eqQuote.set(m.S, { bid: m.bp, ask: m.ap, ts: Date.parse(m.t) || Date.now() });
@@ -204,19 +350,13 @@ async function ensureAlpacaWS() {
   alpacaWS.onclose = () => setTimeout(ensureAlpacaWS, 1200);
   alpacaWS.onerror = () => {};
 }
-/* ----- RESUB HELPERS ----- */
 function resubAlpaca() {
   if (!alpacaWS || alpacaWS.readyState !== 1) return;
   const list = Array.from(alpacaSubs);
-  try {
-    alpacaWS.send(JSON.stringify({ action: "unsubscribe", trades: ["*"], quotes: ["*"] }));
-  } catch {}
-  try {
-    alpacaWS.send(JSON.stringify({ action: "subscribe", trades: list, quotes: list }));
-  } catch {}
+  try { alpacaWS.send(JSON.stringify({ action: "unsubscribe", trades: ["*"], quotes: ["*"] })); } catch {}
+  try { alpacaWS.send(JSON.stringify({ action: "subscribe", trades: list, quotes: list })); } catch {}
 }
-
-function pruneOptionsForUnderlyings(uls /* Set<string> */) {
+function pruneOptionsForUnderlyings(uls) {
   const before = tradierOptWatch.set.size;
   for (const entry of Array.from(tradierOptWatch.set)) {
     try {
@@ -224,7 +364,7 @@ function pruneOptionsForUnderlyings(uls /* Set<string> */) {
       if (uls.has(String(o.underlying).toUpperCase())) tradierOptWatch.set.delete(entry);
     } catch {}
   }
-  return before - tradierOptWatch.set.size; // removed count
+  return before - tradierOptWatch.set.size;
 }
 
 /* ================= TRADIER (equities + options) ================= */
@@ -254,13 +394,11 @@ async function openTradierWsWith(symbols) {
     headers: { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: "application/json" }
   });
   const j = await r.json();
-  console.log("[tradier] session create ->", j);
   const sid = j?.stream?.sessionid ?? j?.sessionid ?? null;
   if (!sid) { console.warn("[tradier] session id null"); return; }
   tradier.sessionId = sid;
 
   const url = buildTradierWsUrl(sid, symbols);
-  console.log("[tradier] WS open:", url);
   tradier.ws = new WebSocket(url);
 
   tradier.ws.onopen = () => {
@@ -271,7 +409,6 @@ async function openTradierWsWith(symbols) {
       linebreak: true,
       validOnly: true
     };
-    console.log("[tradier] subscribe payload ->", payload);
     try { tradier.ws.send(JSON.stringify(payload)); } catch {}
   };
 
@@ -282,91 +419,95 @@ async function openTradierWsWith(symbols) {
       let msg; try { msg = JSON.parse(ln); } catch { continue; }
       const t = (msg.type || "").toLowerCase();
 
-      // cache equity quotes
-      if (t === "quote" && msg.symbol && !/^[A-Z]+(\d{6})([CP])(\d{8})$/.test(msg.symbol)) {
+      // quotes (equity or OCC option)
+      if (t === "quote" && msg.symbol) {
+        const sym = String(msg.symbol);
         const bid = Number(msg.bid ?? msg.b ?? msg.bp);
         const ask = Number(msg.ask ?? msg.a ?? msg.ap);
-        if (Number.isFinite(bid) || Number.isFinite(ask)) {
-          eqQuote.set(msg.symbol, { bid, ask, ts: Date.now() });
+        if (/^[A-Z]+(\d{6})([CP])(\d{8})$/.test(sym)) {
+          if (Number.isFinite(bid) && Number.isFinite(ask) && ask > 0) {
+            optNBBO.set(sym, { bid, ask, ts: Date.now() });
+          }
+        } else {
+          if (Number.isFinite(bid) || Number.isFinite(ask)) {
+            eqQuote.set(sym, { bid, ask, ts: Date.now() });
+          }
         }
         continue;
       }
 
       // trades / timesales
       if ((t === "trade" || t === "timesale") && msg.symbol) {
-        const sym = msg.symbol;
+        const sym = String(msg.symbol);
 
-        // OCC -> option
-        const m = /^([A-Z]+)(\d{6})([CP])(\d{8})$/.exec(sym);
-        if (m) {
-          const [ , ul, yymmdd, cp, k ] = m;
-          const exp = `20${yymmdd.slice(0,2)}-${yymmdd.slice(2,4)}-${yymmdd.slice(4,6)}`;
-          const strike = Number(k)/1000;
-          const right = cp === "C" ? "CALL" : "PUT";
-
+        // option by OCC
+        const mo = parseOcc(sym);
+        if (mo) {
           const price = Number(msg.price ?? msg.last ?? msg.p);
           const size  = Number(msg.size  ?? msg.volume ?? msg.s);
           if (!Number.isFinite(price) || !Number.isFinite(size) || size <= 0) continue;
           const side  = String(msg.side || msg.taker_side || "").toUpperCase().includes("SELL") ? "SELL" : "BUY";
 
-          // mark last-seen for fallback
-          const occ = sym;
-          optLastPrintTs.set(occ, Date.now());
+          optLastPrintTs.set(sym, Date.now());
 
-          // normalize + fanout
           const out = normOptionsPrint("tradier", {
-            underlying: ul,
-            option: { expiration: exp, strike, right },
-            price, size, side, venue: msg.exchange || msg.exch
+            underlying: mo.ul,
+            option: { expiration: mo.exp, strike: mo.strike, right: mo.right },
+            price, size, side, venue: msg.exchange || msg.exch, occ: sym
           });
-          out.occ = occ;
           pushAndFanout(out);
 
-          // block detection
+          // blocks
           const notion = price * size * 100;
           if (size >= BLOCK_MIN_QTY || notion >= BLOCK_MIN_NOTIONAL) {
             pushAndFanout({
               type: "blocks",
               provider: "tradier",
               ts: out.ts,
-              symbol: ul,
-              occ,
+              symbol: mo.ul,
+              occ: out.occ,
               option: out.option,
               side: out.side,
               qty: out.qty,
               price: out.price,
-              notional: notion
+              notional: notion,
+              oc_intent: out.oc_intent,
+              intent_conf: out.intent_conf,
+              fill_at: out.fill_at
             });
           }
 
-          // sweep aggregation (per-contract burst)
-          const existing = sweepBuckets.get(occ);
+          // sweeps (per-contract burst)
+          const existing = sweepBuckets.get(sym);
           const now = Date.now();
-          if (!existing || (now - existing.startTs > SWEEP_WINDOW_MS) || (existing.side !== side)) {
-            sweepBuckets.set(occ, {
-              side, startTs: now, totalQty: size, notional: notion,
-              prints: [{ ts: out.ts, qty: size, price, venue: out.venue }]
+          if (!existing || (now - existing.startTs > SWEEP_WINDOW_MS) || (existing.side !== out.side)) {
+            sweepBuckets.set(sym, {
+              side: out.side, startTs: now, totalQty: out.qty, notional: notion,
+              prints: [{ ts: out.ts, qty: out.qty, price: out.price, venue: out.venue }]
             });
           } else {
-            existing.totalQty += size;
+            existing.totalQty += out.qty;
             existing.notional += notion;
-            existing.prints.push({ ts: out.ts, qty: size, price, venue: out.venue });
+            existing.prints.push({ ts: out.ts, qty: out.qty, price: out.price, venue: out.venue });
           }
-          const bucket = sweepBuckets.get(occ);
+          const bucket = sweepBuckets.get(sym);
           if (bucket && (bucket.totalQty >= SWEEP_MIN_QTY || bucket.notional >= SWEEP_MIN_NOTIONAL)) {
             pushAndFanout({
               type: "sweeps",
               provider: "tradier",
               ts: now,
-              symbol: ul,
-              occ,
+              symbol: mo.ul,
+              occ: out.occ,
               option: out.option,
               side: bucket.side,
               totalQty: bucket.totalQty,
               notional: bucket.notional,
-              prints: bucket.prints
+              prints: bucket.prints,
+              oc_intent: out.oc_intent,
+              intent_conf: out.intent_conf,
+              fill_at: out.fill_at
             });
-            sweepBuckets.delete(occ); // emit once per burst
+            sweepBuckets.delete(sym);
           }
           continue;
         }
@@ -382,8 +523,7 @@ async function openTradierWsWith(symbols) {
 
   tradier.ws.onclose = () => {
     console.warn("[tradier] WS close -> reconnect");
-    tradier.ws = null;
-    tradier.sessionId = null;
+    tradier.ws = null; tradier.sessionId = null;
     setTimeout(ensureTradierWS, 800);
   };
   tradier.ws.onerror = (e) => console.warn("[tradier] WS error", e?.message || e);
@@ -409,9 +549,7 @@ async function ensureTradierWS(forceResub = false) {
       linebreak: true,
       validOnly: true
     };
-    console.log("[tradier] resubscribe payload ->", payload);
     try { tradier.ws.send(JSON.stringify(payload)); } catch (e) {
-      console.warn("[tradier] resubscribe send failed, reopening", e?.message || e);
       try { tradier.ws.close(); } catch {}
       setTimeout(() => ensureTradierWS(false), 250);
     }
@@ -419,7 +557,7 @@ async function ensureTradierWS(forceResub = false) {
 }
 
 /* ================= FALLBACK TIMESALES POLLER ================= */
-const lastPollCursor = new Map(); // occ -> ISO cursor (or null)
+const lastPollCursor = new Map(); // occ -> ISO cursor
 async function pollTimesalesOnce() {
   if (MOCK || !TRADIER_TOKEN) return;
 
@@ -429,15 +567,10 @@ async function pollTimesalesOnce() {
 
   for (const occ of occs) {
     const last = optLastPrintTs.get(occ) || 0;
-    if (now - last < FALLBACK_IDLE_MS) continue; // WS has been active recently
+    if (now - last < FALLBACK_IDLE_MS) continue;
 
     const cursorISO = lastPollCursor.get(occ) || new Date(now - 5000).toISOString();
-    const params = new URLSearchParams({
-      symbol: occ,
-      interval: "tick",
-      start: cursorISO,
-      session_filter: "all"
-    });
+    const params = new URLSearchParams({ symbol: occ, interval: "tick", start: cursorISO, session_filter: "all" });
     const url = `${TRADIER_REST}/v1/markets/timesales?${params.toString()}`;
     const r = await fetch(url, { headers: { "Accept": "application/json", Authorization: `Bearer ${TRADIER_TOKEN}` } });
     if (!r.ok) continue;
@@ -453,47 +586,32 @@ async function pollTimesalesOnce() {
       if (!Number.isFinite(price) || !Number.isFinite(size) || size <= 0) continue;
       maxTs = Math.max(maxTs, ts);
 
-      // parse OCC back -> UL/exp/strike/right
-      const m = /^([A-Z]+)(\d{6})([CP])(\d{8})$/.exec(occ);
-      if (!m) continue;
-      const [ , ul, yymmdd, cp, k ] = m;
-      const exp = `20${yymmdd.slice(0,2)}-${yymmdd.slice(2,4)}-${yymmdd.slice(4,6)}`;
-      const strike = Number(k)/1000;
-      const right = cp === "C" ? "CALL" : "PUT";
-      const side  = (p.side || p.taker_side || "").toUpperCase().includes("SELL") ? "SELL" : "BUY";
+      const meta = parseOcc(occ);
+      if (!meta) continue;
+      const side  = (String(p.side || p.taker_side || "").toUpperCase().includes("SELL")) ? "SELL" : "BUY";
 
       const out = normOptionsPrint("tradier", {
-        underlying: ul,
-        option: { expiration: exp, strike, right },
-        price, size, side, venue: p.exch || p.venue
+        underlying: meta.ul,
+        option: { expiration: meta.exp, strike: meta.strike, right: meta.right },
+        price, size, side, venue: (p.exch || p.venue) ?? null, occ
       });
       out.ts = ts;
-      out.occ = occ;
       pushAndFanout(out);
 
-      // apply block/sweep logic here too
       const notion = price * size * 100;
       if (size >= BLOCK_MIN_QTY || notion >= BLOCK_MIN_NOTIONAL) {
         pushAndFanout({
-          type: "blocks",
-          provider: "tradier",
-          ts: out.ts,
-          symbol: ul,
-          occ,
-          option: out.option,
-          side: out.side,
-          qty: out.qty,
-          price: out.price,
-          notional: notion
+          type: "blocks", provider: "tradier", ts,
+          symbol: meta.ul, occ, option: out.option, side: out.side,
+          qty: out.qty, price: out.price, notional: notion,
+          oc_intent: out.oc_intent, intent_conf: out.intent_conf, fill_at: out.fill_at
         });
       }
 
       const existing = sweepBuckets.get(occ);
-      if (!existing || (ts - existing.startTs > SWEEP_WINDOW_MS) || (existing.side !== side)) {
-        sweepBuckets.set(occ, {
-          side, startTs: ts, totalQty: size, notional: notion,
-          prints: [{ ts, qty: size, price, venue: out.venue }]
-        });
+      if (!existing || (ts - existing.startTs > SWEEP_WINDOW_MS) || (existing.side !== out.side)) {
+        sweepBuckets.set(occ, { side: out.side, startTs: ts, totalQty: size, notional: notion,
+          prints: [{ ts, qty: size, price, venue: out.venue }] });
       } else {
         existing.totalQty += size;
         existing.notional += notion;
@@ -502,23 +620,17 @@ async function pollTimesalesOnce() {
       const bucket = sweepBuckets.get(occ);
       if (bucket && (bucket.totalQty >= SWEEP_MIN_QTY || bucket.notional >= SWEEP_MIN_NOTIONAL)) {
         pushAndFanout({
-          type: "sweeps",
-          provider: "tradier",
-          ts,
-          symbol: ul,
-          occ,
-          option: out.option,
-          side: bucket.side,
-          totalQty: bucket.totalQty,
-          notional: bucket.notional,
-          prints: bucket.prints
+          type: "sweeps", provider: "tradier", ts,
+          symbol: meta.ul, occ, option: out.option, side: bucket.side,
+          totalQty: bucket.totalQty, notional: bucket.notional, prints: bucket.prints,
+          oc_intent: out.oc_intent, intent_conf: out.intent_conf, fill_at: out.fill_at
         });
         sweepBuckets.delete(occ);
       }
     }
     if (maxTs) {
       lastPollCursor.set(occ, new Date(maxTs + 1).toISOString());
-      optLastPrintTs.set(occ, maxTs); // keep it “fresh” so we don't hammer
+      optLastPrintTs.set(occ, maxTs);
     }
   }
 }
@@ -535,7 +647,6 @@ async function getUlPrice(ul) {
   const last = Number(q.last ?? q.close ?? q.price);
   return Number.isFinite(last) ? last : null;
 }
-
 async function getExpirations(ul) {
   const url = `${TRADIER_REST}/v1/markets/options/expirations?symbol=${encodeURIComponent(ul)}&includeAllRoots=true&strikes=false`;
   const r = await fetch(url, { headers: { "Accept": "application/json", Authorization: `Bearer ${TRADIER_TOKEN}` } });
@@ -543,7 +654,6 @@ async function getExpirations(ul) {
   const j = await r.json();
   return (j?.expirations?.date || []).map(String);
 }
-
 function within30Days(dISO) {
   const t = Date.parse(dISO);
   if (!Number.isFinite(t)) return false;
@@ -565,9 +675,22 @@ async function expandAndWatchChain(ul) {
     const list = j?.options?.option || [];
     if (!list.length) continue;
 
-    // pick ATM +/- around last price; if no last, center by median strike
-    const strikes = Array.from(new Set(list.map(o => Number(o.strike)))).sort((a,b)=>a-b);
-    const center = Number.isFinite(last) ? last : strikes[Math.floor(strikes.length/2)] || 0;
+    // collect strikes + baseline OI
+    const strikesSet = new Set();
+    for (const c of list) {
+      const k = toOcc(
+        (c.underlying || c.underlying_symbol || ul).toString(),
+        String(c.expiration_date || exp),
+        (String(c.option_type || c.right || "").toUpperCase().startsWith("C") ? "CALL" : "PUT"),
+        Number(c.strike)
+      );
+      const oi = Number(c.open_interest || c.oi || 0);
+      if (Number.isFinite(oi)) setOptOI(k.replace(/^[A-Z]+/, ul.toUpperCase()), oi);
+      const st = Number(c.strike); if (Number.isFinite(st)) strikesSet.add(st);
+    }
+
+    const strikes = Array.from(strikesSet).sort((a,b)=>a-b);
+    const center = Number.isFinite(last) ? last : (strikes[Math.floor(strikes.length/2)] || 0);
     const best = strikes
       .map(s => ({ s, d: Math.abs(s - center) }))
       .sort((a,b)=>a.d - b.d)
@@ -575,7 +698,6 @@ async function expandAndWatchChain(ul) {
       .map(x => x.s)
       .sort((a,b)=>a-b);
 
-    // add both calls & puts for those strikes
     for (const k of best) {
       for (const right of ["CALL","PUT"]) {
         const entry = JSON.stringify({ underlying: ul.toUpperCase(), expiration: exp, strike: k, right });
@@ -583,36 +705,30 @@ async function expandAndWatchChain(ul) {
       }
     }
 
-    // push a chain snapshot for UI
     pushAndFanout({
-      type: "chains",
-      provider: "tradier",
-      ts: Date.now(),
-      symbol: ul.toUpperCase(),
-      expiration: exp,
-      strikes: best,
-      strikesCount: best.length
+      type: "chains", provider: "tradier", ts: Date.now(),
+      symbol: ul.toUpperCase(), expiration: exp, strikes: best, strikesCount: best.length
     });
   }
 
-  // refresh WS with expanded list
   ensureTradierWS(true);
 }
 
-/* ================= WS BOOTSTRAP ================= */
+/* ================= WS (client) BOOTSTRAP ================= */
 wss.on("connection", (sock) => {
   sock.on("message", (buf) => {
     try {
       const m = JSON.parse(String(buf));
       if (Array.isArray(m.subscribe)) {
         for (const t of m.subscribe) {
-          (buffers[t] ?? []).slice(0, 50).forEach(it => sock.send(JSON.stringify(it)));
+          (buffers[t] || []).slice(0, 50).forEach(it => sock.send(JSON.stringify(it)));
         }
       }
     } catch {}
   });
 });
-/* Add equities (and auto-expand options for them) */
+
+/* ================= WATCH ENDPOINTS ================= */
 app.post("/watch/symbols", async (req, res) => {
   const symbols = new Set([...(req.body?.symbols || [])].map(s => String(s).toUpperCase()).filter(Boolean));
   if (!symbols.size) return res.json({ ok: true, added: 0, watching: { equities: Array.from(alpacaSubs) } });
@@ -622,45 +738,30 @@ app.post("/watch/symbols", async (req, res) => {
 
   if (!MOCK) {
     await ensureAlpacaWS();
-    // expand & watch option chains for these ULs
-    if (TRADIER_TOKEN) {
-      for (const ul of symbols) await expandAndWatchChain(ul);
-    }
+    if (TRADIER_TOKEN) { for (const ul of symbols) await expandAndWatchChain(ul); }
     ensureTradierWS(true);
     resubAlpaca();
   }
 
   res.json({ ok: true, added, watching: { equities: Array.from(alpacaSubs) } });
 });
-/* Remove equities (and stop all related option contracts) */
+
 app.delete("/watch/symbols", async (req, res) => {
   const symbols = new Set([...(req.body?.symbols || [])].map(s => String(s).toUpperCase()).filter(Boolean));
   if (!symbols.size) return res.json({ ok: true, removed: 0, optsRemoved: 0, watching: { equities: Array.from(alpacaSubs) } });
 
   let removed = 0;
   for (const s of symbols) if (alpacaSubs.delete(s)) removed++;
-
-  // remove all watched options whose underlying is now removed
   const optsRemoved = pruneOptionsForUnderlyings(symbols);
 
-  if (!MOCK) {
-    // resub Alpaca with current equities
-    resubAlpaca();
-    // resub Tradier with pruned set
-    ensureTradierWS(true);
-  }
+  if (!MOCK) { resubAlpaca(); ensureTradierWS(true); }
 
-  res.json({
-    ok: true,
-    removed,
-    optsRemoved,
-    watching: {
-      equities: Array.from(alpacaSubs),
-      options: Array.from(tradierOptWatch.set).map(JSON.parse)
-    }
-  });
+  res.json({ ok: true, removed, optsRemoved, watching: {
+    equities: Array.from(alpacaSubs),
+    options: Array.from(tradierOptWatch.set).map(JSON.parse)
+  } });
 });
-/* Remove explicit option contracts */
+
 app.delete("/watch/tradier", (req, res) => {
   const options = Array.isArray(req.body?.options) ? req.body.options : [];
   let removed = 0;
@@ -677,7 +778,6 @@ app.delete("/watch/tradier", (req, res) => {
   res.json({ ok: true, removed, watching: { options: Array.from(tradierOptWatch.set).map(JSON.parse) } });
 });
 
-/* Remove equities directly (no options inference) */
 app.delete("/watch/alpaca", (req, res) => {
   const equities = new Set([...(req.body?.equities || [])].map(s => String(s).toUpperCase()).filter(Boolean));
   let removed = 0;
@@ -685,36 +785,26 @@ app.delete("/watch/alpaca", (req, res) => {
   if (!MOCK) { resubAlpaca(); ensureTradierWS(true); }
   res.json({ ok: true, removed, watching: { equities: Array.from(alpacaSubs) } });
 });
-/* Current watchlist (equities + explicit option contracts) */
+
 app.get("/watchlist", (_req, res) => {
-  res.json({
-    equities: Array.from(alpacaSubs),
-    options: Array.from(tradierOptWatch.set).map(JSON.parse)
-  });
+  res.json({ equities: Array.from(alpacaSubs), options: Array.from(tradierOptWatch.set).map(JSON.parse) });
 });
-/* Alias: POST /unwatch/symbols does the same as DELETE /watch/symbols */
+
 app.post("/unwatch/symbols", async (req, res) => {
   const symbols = new Set([...(req.body?.symbols || [])].map(s => String(s).toUpperCase()).filter(Boolean));
   if (!symbols.size) return res.json({ ok: true, removed: 0, optsRemoved: 0, watching: { equities: Array.from(alpacaSubs) } });
 
   let removed = 0;
   for (const s of symbols) if (alpacaSubs.delete(s)) removed++;
-
   const optsRemoved = pruneOptionsForUnderlyings(symbols);
-
   if (!MOCK) { resubAlpaca(); ensureTradierWS(true); }
 
-  res.json({
-    ok: true,
-    removed,
-    optsRemoved,
-    watching: {
-      equities: Array.from(alpacaSubs),
-      options: Array.from(tradierOptWatch.set).map(JSON.parse),
-    }
-  });
+  res.json({ ok: true, removed, optsRemoved, watching: {
+    equities: Array.from(alpacaSubs),
+    options: Array.from(tradierOptWatch.set).map(JSON.parse),
+  } });
 });
-/* ================= WATCH ENDPOINTS ================= */
+
 app.post("/watch/alpaca", (req, res) => {
   const equities = new Set([...(req.body?.equities || [])].map(s => String(s).toUpperCase()).filter(Boolean));
   let added = 0;
@@ -727,7 +817,6 @@ app.post("/watch/tradier", async (req, res) => {
   const options = Array.isArray(req.body?.options) ? req.body.options : [];
   let added = 0;
 
-  // Explicit contracts
   for (const o of options) {
     const entry = JSON.stringify({
       underlying: String(o.underlying).toUpperCase(),
@@ -738,10 +827,8 @@ app.post("/watch/tradier", async (req, res) => {
     if (!tradierOptWatch.set.has(entry)) { tradierOptWatch.set.add(entry); added++; }
   }
 
-  // Auto-expand full chain window for any underlyings passed in equities or in options list
   const uls = new Set();
   for (const o of options) if (o?.underlying) uls.add(String(o.underlying).toUpperCase());
-  // also: if no options provided, read equities being watched and expand those too if desired
   if (uls.size === 0 && alpacaSubs.size) for (const s of alpacaSubs) uls.add(s);
 
   if (!MOCK && TRADIER_TOKEN) {
@@ -749,14 +836,91 @@ app.post("/watch/tradier", async (req, res) => {
   }
 
   if (!MOCK) ensureTradierWS(true);
-  res.json({
-    ok: true,
-    watching: { options: Array.from(tradierOptWatch.set).map(JSON.parse) },
-    added
-  });
+  res.json({ ok: true, watching: { options: Array.from(tradierOptWatch.set).map(JSON.parse) }, added });
+});
+/**
+ * POST /analytics/oi-snapshot
+ * Body: { date: "YYYY-MM-DD", rows: [{ occ, oi } | { underlying, expiration, right, strike, oi }, ...] }
+ * Saves EOD OI and immediately runs confirmation for that date where possible.
+ */
+app.post("/analytics/oi-snapshot", (req, res) => {
+  try {
+    const dateStr = String(req.body?.date || "").slice(0,10);
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+    }
+    const recorded = recordEodRows(dateStr, rows);
+
+    // try confirming each distinct OCC we just recorded
+    let confirmedCount = 0;
+    const occs = new Set();
+    for (const r of rows) {
+      const occ = r.occ
+        || (r.underlying && r.expiration && r.right && Number.isFinite(Number(r.strike))
+            ? toOcc(String(r.underlying).toUpperCase(), String(r.expiration), String(r.right).toUpperCase(), Number(r.strike))
+            : null);
+      if (occ) occs.add(occ);
+    }
+    for (const occ of occs) confirmedCount += confirmOccForDate(occ, dateStr);
+
+    res.json({ ok: true, recorded, confirmed: confirmedCount });
+  } catch (e) {
+    console.error("/analytics/oi-snapshot error", e);
+    res.status(500).json({ error: "internal error" });
+  }
 });
 
-/* ================= DEBUG ================= */
+/**
+ * POST /analytics/confirm
+ * Body: { date: "YYYY-MM-DD", occs?: [ "AAPL251122C00215000", ... ] }
+ * If occs omitted, we confirm every OCC that has snapshots for that date and previous date.
+ */
+app.post("/analytics/confirm", (req, res) => {
+  try {
+    const dateStr = String(req.body?.date || "").slice(0,10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+    }
+    const provided = Array.isArray(req.body?.occs) ? new Set(req.body.occs.map(String)) : null;
+
+    // build candidate set
+    const occs = new Set();
+    for (const key of eodOiByDateOcc.keys()) {
+      const [d, occ] = key.split("|");
+      if (d === dateStr && (!provided || provided.has(occ))) occs.add(occ);
+    }
+
+    let confirmedCount = 0;
+    for (const occ of occs) confirmedCount += confirmOccForDate(occ, dateStr);
+
+    res.json({ ok: true, date: dateStr, occs: Array.from(occs), confirmed: confirmedCount });
+  } catch (e) {
+    console.error("/analytics/confirm error", e);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+/**
+ * GET /debug/oi?occ=OCC&date=YYYY-MM-DD
+ * Quick peek at stored OI for (date-1, date) and computed delta.
+ */
+app.get("/debug/oi", (req, res) => {
+  const occ = String(req.query?.occ || "");
+  const dateStr = String(req.query?.date || "");
+  if (!occ || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    return res.status(400).json({ error: "need occ and date=YYYY-MM-DD" });
+  }
+  const prevDate = new Date(dateStr);
+  prevDate.setUTCDate(prevDate.getUTCDate() - 1);
+  const prev = prevDate.toISOString().slice(0,10);
+  const oiPrev = eodOiByDateOcc.get(`${prev}|${occ}`);
+  const oiCurr = eodOiByDateOcc.get(`${dateStr}|${occ}`);
+  const delta = (Number.isFinite(oiPrev) && Number.isFinite(oiCurr)) ? (oiCurr - oiPrev) : null;
+  res.json({ occ, prev, date: dateStr, oiPrev, oiCurr, delta });
+});
+
+/* ================= DEBUG / BACKFILL ================= */
 app.get("/debug/state", (_req, res) => {
   const occs = Array.from(tradierOptWatch.set).map(JSON.parse)
     .map(o => toOcc(o.underlying, o.expiration, o.right, o.strike));
@@ -770,7 +934,6 @@ app.get("/debug/state", (_req, res) => {
   });
 });
 
-/* ================= BACKFILL REST ================= */
 app.get("/api/flow/options_ts", (_, res) => res.json(buffers.options_ts));
 app.get("/api/flow/equity_ts",  (_, res) => res.json(buffers.equity_ts));
 app.get("/api/flow/sweeps",     (_, res) => res.json(buffers.sweeps));
@@ -778,13 +941,8 @@ app.get("/api/flow/blocks",     (_, res) => res.json(buffers.blocks));
 app.get("/api/flow/chains",     (_, res) => res.json(buffers.chains));
 app.get("/health",               (_, res) => res.json({ ok: true }));
 app.get("/debug/metrics",        (_req, res) => res.json({ mock: MOCK, count: httpMetrics.length, last5: httpMetrics.slice(-5) }));
-app.use((req, res) => {
-  res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` });
-});
-app.use((err, req, res, next) => {
-  console.error("Server error:", err);
-  res.status(err.status || 500).json({ error: err.message || "Internal Server Error" });
-});
+app.use((req, res) => { res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` }); });
+app.use((err, _req, res, _next) => { console.error("Server error:", err); res.status(err.status || 500).json({ error: err.message || "Internal Server Error" }); });
 
 /* ================= START ================= */
 server.listen(PORT, () => console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK ? "on" : "off"}`));
