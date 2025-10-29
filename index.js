@@ -37,7 +37,35 @@ const FALLBACK_POLL_EVERY_MS = 1500;
 
 /* ================= APP / WS ================= */
 const app = express();
-app.use(cors());
+// CORS — allow your site + local dev, send headers on all responses (incl. 304)
+const ALLOWED_ORIGINS = [
+  'https://www.tradeflow.lol',
+  'https://tradeflow.lol',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:19006',
+];
+
+const corsOptions = {
+  origin(origin, cb) {
+    // allow same-origin/no-origin (mobile apps, curl) and whitelisted sites
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: false,           // set true only if you use cookies/auth headers across origins
+  maxAge: 86400,                // cache preflight
+};
+
+// Ensure Vary so proxies don’t reuse wrong CORS headers
+app.use((req,res,next) => { res.setHeader('Vary','Origin'); next(); });
+
+// Add CORS before any routes/middleware that send responses
+app.use(cors(corsOptions));
+// Also handle preflight for all routes
+app.options('*', cors(corsOptions));
+
 app.use(express.json({ limit: "2mb" }));
 app.use(compression());
 app.use(morgan("tiny"));
