@@ -692,7 +692,28 @@ app.get("/watchlist", (_req, res) => {
     options: Array.from(tradierOptWatch.set).map(JSON.parse)
   });
 });
+/* Alias: POST /unwatch/symbols does the same as DELETE /watch/symbols */
+app.post("/unwatch/symbols", async (req, res) => {
+  const symbols = new Set([...(req.body?.symbols || [])].map(s => String(s).toUpperCase()).filter(Boolean));
+  if (!symbols.size) return res.json({ ok: true, removed: 0, optsRemoved: 0, watching: { equities: Array.from(alpacaSubs) } });
 
+  let removed = 0;
+  for (const s of symbols) if (alpacaSubs.delete(s)) removed++;
+
+  const optsRemoved = pruneOptionsForUnderlyings(symbols);
+
+  if (!MOCK) { resubAlpaca(); ensureTradierWS(true); }
+
+  res.json({
+    ok: true,
+    removed,
+    optsRemoved,
+    watching: {
+      equities: Array.from(alpacaSubs),
+      options: Array.from(tradierOptWatch.set).map(JSON.parse),
+    }
+  });
+});
 /* ================= WATCH ENDPOINTS ================= */
 app.post("/watch/alpaca", (req, res) => {
   const equities = new Set([...(req.body?.equities || [])].map(s => String(s).toUpperCase()).filter(Boolean));
