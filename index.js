@@ -40,19 +40,6 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 app.use(compression());
 app.use(morgan("tiny"));
-//app.use((req, res, next) => {
-  //res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` });
-//});
-
-// Error -> JSON (avoid HTML)
-app.use((err, req, res, next) => {
-  console.error("Server error:", err);
-  const code = Number(err?.status) || 500;
-  res
-    .status(code)
-    .type("application/json")
-    .send(JSON.stringify({ error: err?.message || "Internal Server Error" }));
-});
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -668,6 +655,13 @@ app.get("/api/flow/blocks",     (_, res) => res.json(buffers.blocks));
 app.get("/api/flow/chains",     (_, res) => res.json(buffers.chains));
 app.get("/health",               (_, res) => res.json({ ok: true }));
 app.get("/debug/metrics",        (_req, res) => res.json({ mock: MOCK, count: httpMetrics.length, last5: httpMetrics.slice(-5) }));
+app.use((req, res) => {
+  res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` });
+});
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(err.status || 500).json({ error: err.message || "Internal Server Error" });
+});
 
 /* ================= START ================= */
 server.listen(PORT, () => console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK ? "on" : "off"}`));
