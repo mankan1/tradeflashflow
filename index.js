@@ -204,6 +204,28 @@ async function ensureAlpacaWS() {
   alpacaWS.onclose = () => setTimeout(ensureAlpacaWS, 1200);
   alpacaWS.onerror = () => {};
 }
+/* ----- RESUB HELPERS ----- */
+function resubAlpaca() {
+  if (!alpacaWS || alpacaWS.readyState !== 1) return;
+  const list = Array.from(alpacaSubs);
+  try {
+    alpacaWS.send(JSON.stringify({ action: "unsubscribe", trades: ["*"], quotes: ["*"] }));
+  } catch {}
+  try {
+    alpacaWS.send(JSON.stringify({ action: "subscribe", trades: list, quotes: list }));
+  } catch {}
+}
+
+function pruneOptionsForUnderlyings(uls /* Set<string> */) {
+  const before = tradierOptWatch.set.size;
+  for (const entry of Array.from(tradierOptWatch.set)) {
+    try {
+      const o = JSON.parse(entry);
+      if (uls.has(String(o.underlying).toUpperCase())) tradierOptWatch.set.delete(entry);
+    } catch {}
+  }
+  return before - tradierOptWatch.set.size; // removed count
+}
 
 /* ================= TRADIER (equities + options) ================= */
 const tradier = { ws: null, sessionId: null, connecting: false };
@@ -588,6 +610,86 @@ wss.on("connection", (sock) => {
         }
       }
     } catch {}
+  });
+});
+/* Add equities (and auto-expand options for them) */
+app.post("/watch/symbols", async (req, res) => {
+  const symbols = new Set([...(req.body?.symbols || [])].map(s => String(s).toUpperCase()).filter(Boolean));
+  if (!symbols.size) return res.json({ ok: true, added: 0, watching: { equities: Array.from(alpacaSubs) } });
+
+  let added = 0;
+  for (const s of symbols) if (!alpacaSubs.has(s)) { alpacaSubs.add(s); added++; }
+
+  if (!MOCK) {
+    await ensureAlpacaWS();
+    // expand & watch option chains for these ULs
+    if (TRADIER_TOKEN) {
+      for (const ul of symbols) await expandAndWatchChain(ul);
+    }
+    ensureTradierWS(true);
+    resubAlpaca();
+  }
+
+  res.json({ ok: true, added, watching: { equities: Array.from(alpacaSubs) } });
+});
+/* Remove equities (and stop all related option contracts) */
+app.delete("/watch/symbols", async (req, res) => {
+  const symbols = new Set([...(req.body?.symbols || [])].map(s => String(s).toUpperCase()).filter(Boolean));
+  if (!symbols.size) return res.json({ ok: true, removed: 0, optsRemoved: 0, watching: { equities: Array.from(alpacaSubs) } });
+
+  let removed = 0;
+  for (const s of symbols) if (alpacaSubs.delete(s)) removed++;
+
+  // remove all watched options whose underlying is now removed
+  const optsRemoved = pruneOptionsForUnderlyings(symbols);
+
+  if (!MOCK) {
+    // resub Alpaca with current equities
+    resubAlpaca();
+    // resub Tradier with pruned set
+    ensureTradierWS(true);
+  }
+
+  res.json({
+    ok: true,
+    removed,
+    optsRemoved,
+    watching: {
+      equities: Array.from(alpacaSubs),
+      options: Array.from(tradierOptWatch.set).map(JSON.parse)
+    }
+  });
+});
+/* Remove explicit option contracts */
+app.delete("/watch/tradier", (req, res) => {
+  const options = Array.isArray(req.body?.options) ? req.body.options : [];
+  let removed = 0;
+  for (const o of options) {
+    const entry = JSON.stringify({
+      underlying: String(o.underlying).toUpperCase(),
+      expiration: String(o.expiration),
+      strike: Number(o.strike),
+      right: String(o.right).toUpperCase()
+    });
+    if (tradierOptWatch.set.delete(entry)) removed++;
+  }
+  if (!MOCK) ensureTradierWS(true);
+  res.json({ ok: true, removed, watching: { options: Array.from(tradierOptWatch.set).map(JSON.parse) } });
+});
+
+/* Remove equities directly (no options inference) */
+app.delete("/watch/alpaca", (req, res) => {
+  const equities = new Set([...(req.body?.equities || [])].map(s => String(s).toUpperCase()).filter(Boolean));
+  let removed = 0;
+  for (const s of equities) if (alpacaSubs.delete(s)) removed++;
+  if (!MOCK) { resubAlpaca(); ensureTradierWS(true); }
+  res.json({ ok: true, removed, watching: { equities: Array.from(alpacaSubs) } });
+});
+/* Current watchlist (equities + explicit option contracts) */
+app.get("/watchlist", (_req, res) => {
+  res.json({
+    equities: Array.from(alpacaSubs),
+    options: Array.from(tradierOptWatch.set).map(JSON.parse)
   });
 });
 
