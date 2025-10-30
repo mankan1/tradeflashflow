@@ -14,7 +14,7 @@ const rawMock = (process.env.MOCK ?? "").toString().trim();
 export const MOCK = rawMock === "1";
 const PORT = process.env.PORT || 8080;
 
-const TRADIER_REST   = process.env.TRADIER_BASE || "https://api.tradier.com";
+const TRADIER_REST   = "https://api.tradier.com";
 // const TRADIER_TOKEN  = process.env.TRADIER_TOKEN || "REPLACE_ME";
 // const ALPACA_KEY     = process.env.ALPACA_KEY     || "";
 // const ALPACA_SECRET  = process.env.ALPACA_SECRET  || "";
