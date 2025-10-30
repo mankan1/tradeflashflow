@@ -41,24 +41,20 @@ const FALLBACK_POLL_EVERY_MS = 1500;
 const app = express();
 // CORS — allow your site + local dev, send headers on all responses (incl. 304)
 const ORIGINS = [
-  "https://tradeflow.lol",
   "https://www.tradeflow.lol",
-  "https://tradeflash.pro",
-  "https://tradeflashcli.vercel.app",
-  "https://tradeflash-production.up.railway.app",
+  "https://tradeflow.lol",
+  "tradeflashflow-production.up.railway.app",
+  /\.vercel\.app$/,
   'http://localhost:5173',
   'http://localhost:3000',
   'http://localhost:19006',
-  /\.vercel\.app$/,
-  /\.tradeflow\.lol$/,  // any subdomain if you use previews
 ];
-
 
 const isAllowed = (o) => ORIGINS.some(r => r instanceof RegExp ? r.test(o) : r === o);
 
 const corsMiddleware = cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true);            // curl/Postman/no Origin
+    if (!origin) return cb(null, true);           // curl/Postman
     return isAllowed(origin) ? cb(null, true)
       : cb(new Error(`CORS: origin not allowed: ${origin}`));
   },
@@ -979,7 +975,11 @@ app.get("/api/flow/chains",     (_, res) => res.json(buffers.chains));
 app.get("/health",               (_, res) => res.json({ ok: true }));
 app.get("/debug/metrics",        (_req, res) => res.json({ mock: MOCK, count: httpMetrics.length, last5: httpMetrics.slice(-5) }));
 app.use((req, res) => { res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` }); });
-app.use((err, _req, res, _next) => { console.error("Server error:", err); res.status(err.status || 500).json({ error: err.message || "Internal Server Error" }); });
-
+// app.use((err, _req, res, _next) => { console.error("Server error:", err); res.status(err.status || 500).json({ error: err.message || "Internal Server Error" }); });
+app.use((err, req, res, next) => {
+  const o = req.headers.origin;
+  if (o && isAllowed(o)) { res.setHeader("Access-Control-Allow-Origin", o); res.setHeader("Vary","Origin"); }
+  res.status(err.status || 500).json({ ok:false, error: String(err.message || err) });
+});
 /* ================= START ================= */
 server.listen(PORT, () => console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK ? "on" : "off"}`));
