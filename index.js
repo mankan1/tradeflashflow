@@ -42,30 +42,38 @@ const app = express();
 // CORS — allow your site + local dev, send headers on all responses (incl. 304)
 const ALLOWED_ORIGINS = [
   "https://tradeflow.lol",
-  "https://www.tradeflow.lol",          // <= add this
+  "https://www.tradeflow.lol",
+  "https://tradeflash.pro",
+  "https://tradeflashcli.vercel.app",
+  "https://tradeflash-production.up.railway.app",
   'http://localhost:5173',
   'http://localhost:3000',
   'http://localhost:19006',
   /\.vercel\.app$/,
-  /\.tradeflow\.lol$/                    // optional: allow any subdomain of tradeflow.lol
+  /\.tradeflow\.lol$/,  // any subdomain if you use previews
 ];
 
-function isAllowedOrigin(origin) {
-  return ORIGINS.some(r => r instanceof RegExp ? r.test(origin) : r === origin);
-}
+
+const isAllowed = (o) => ORIGINS.some(r => r instanceof RegExp ? r.test(o) : r === o);
 
 const corsMiddleware = cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    return isAllowedOrigin(origin) ? cb(null, true) : cb(new Error(`CORS: origin not allowed: ${origin}`));
+    if (!origin) return cb(null, true);            // curl/Postman/no Origin
+    return isAllowed(origin) ? cb(null, true)
+      : cb(new Error(`CORS: origin not allowed: ${origin}`));
   },
   methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
   allowedHeaders: ["Content-Type","Authorization","x-request-id"],
   credentials: false,
   maxAge: 86400,
+  optionsSuccessStatus: 204,
 });
+
+// must be the FIRST app middleware
+app.use((req,res,next)=>{ res.header("Vary","Origin"); next(); });
+
 app.use(corsMiddleware);
-app.options("*", corsMiddleware);
+app.options("*", corsMiddleware);                  // same rules for preflights
 
 app.use(express.json({ limit: "2mb" }));
 app.use(compression());
