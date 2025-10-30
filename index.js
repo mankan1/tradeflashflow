@@ -41,32 +41,31 @@ const FALLBACK_POLL_EVERY_MS = 1500;
 const app = express();
 // CORS — allow your site + local dev, send headers on all responses (incl. 304)
 const ALLOWED_ORIGINS = [
-  'https://www.tradeflow.lol',
-  'https://tradeflow.lol',
+  "https://tradeflow.lol",
+  "https://www.tradeflow.lol",          // <= add this
   'http://localhost:5173',
   'http://localhost:3000',
   'http://localhost:19006',
+  /\.vercel\.app$/,
+  /\.tradeflow\.lol$/                    // optional: allow any subdomain of tradeflow.lol
 ];
 
-const corsOptions = {
+function isAllowedOrigin(origin) {
+  return ORIGINS.some(r => r instanceof RegExp ? r.test(origin) : r === origin);
+}
+
+const corsMiddleware = cors({
   origin(origin, cb) {
-    // allow same-origin/no-origin (mobile apps, curl) and whitelisted sites
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
+    if (!origin) return cb(null, true);
+    return isAllowedOrigin(origin) ? cb(null, true) : cb(new Error(`CORS: origin not allowed: ${origin}`));
   },
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-  credentials: false,           // set true only if you use cookies/auth headers across origins
-  maxAge: 86400,                // cache preflight
-};
-
-// Ensure Vary so proxies don’t reuse wrong CORS headers
-app.use((req,res,next) => { res.setHeader('Vary','Origin'); next(); });
-
-// Add CORS before any routes/middleware that send responses
-app.use(cors(corsOptions));
-// Also handle preflight for all routes
-app.options('*', cors(corsOptions));
+  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization","x-request-id"],
+  credentials: false,
+  maxAge: 86400,
+});
+app.use(corsMiddleware);
+app.options("*", corsMiddleware);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(compression());
