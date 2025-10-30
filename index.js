@@ -40,7 +40,7 @@ const FALLBACK_POLL_EVERY_MS = 1500;
 /* ================= APP / WS ================= */
 const app = express();
 // CORS — allow your site + local dev, send headers on all responses (incl. 304)
-const ALLOWED_ORIGINS = [
+const ORIGINS = [
   "https://tradeflow.lol",
   "https://www.tradeflow.lol",
   "https://tradeflash.pro",
