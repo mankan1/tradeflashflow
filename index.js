@@ -43,6 +43,7 @@ const app = express();
 const ORIGINS = [
   "https://www.tradeflow.lol",
   "https://tradeflow.lol",
+  "https://tradeflashflow-production.up.railway.app", // <-- add scheme
   "tradeflashflow-production.up.railway.app",
   /\.vercel\.app$/,
   'http://localhost:5173',
@@ -758,6 +759,17 @@ wss.on("connection", (sock) => {
         }
       }
     } catch {}
+  });
+});
+
+// add next to your other WATCH endpoints
+app.get("/watch/symbols", (_req, res) => {
+  res.json({
+    ok: true,
+    watching: {
+      equities: Array.from(alpacaSubs),
+      options: Array.from(tradierOptWatch.set).map(JSON.parse),
+    },
   });
 });
 
